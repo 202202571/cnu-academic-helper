@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CNU 학사 도우미</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Malgun Gothic", sans-serif; background: #f3f5f9; color: #222; }
+  header { background: #00427a; color: #fff; padding: 16px 24px; }
+  header h1 { font-size: 20px; }
+  header p { font-size: 13px; opacity: .85; margin-top: 4px; }
+  .wrap { max-width: 760px; margin: 24px auto; padding: 0 16px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tab { padding: 6px 14px; border-radius: 16px; border: 1px solid #00427a;
+         background: #fff; color: #00427a; cursor: pointer; font-size: 14px; }
+  .tab.active { background: #00427a; color: #fff; }
+  .chat { background: #fff; border-radius: 12px; padding: 20px; min-height: 380px; max-height: 70vh;
+          overflow-y: auto; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+  .msg { margin-bottom: 14px; line-height: 1.6; font-size: 15px; }
+  .bot { background: #eef3fa; padding: 12px 14px; border-radius: 10px; white-space: pre-wrap; }
+  .bot.loading { color: #777; }
+  .user { text-align: right; }
+  .user span { display: inline-block; background: #00427a; color: #fff;
+               padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; text-align: left; }
+  .source { margin-top: 10px; border-left: 3px solid #00427a; background: #fff;
+            padding: 8px 12px; font-size: 13px; color: #555; white-space: normal; }
+  .source summary { cursor: pointer; color: #00427a; }
+  .source blockquote { margin: 6px 0; padding-left: 8px; border-left: 2px solid #ccd6e3; color: #444; }
+  .source a { color: #00427a; }
+  .feedback { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; white-space: normal; }
+  .feedback input { flex: 1; min-width: 140px; padding: 6px 8px; border: 1px solid #ccd6e3; border-radius: 6px; font-size: 13px; }
+  .feedback button, .suggest button { border: 1px solid #ccd6e3; background: #fff; border-radius: 16px;
+                    padding: 6px 12px; font-size: 13px; cursor: pointer; }
+  .feedback .done { font-size: 13px; color: #2a7a3b; }
+  .suggest { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; white-space: normal; }
+  .input { display: flex; gap: 8px; margin-top: 12px; }
+  .input input { flex: 1; min-width: 0; padding: 12px; border: 1px solid #ccd6e3; border-radius: 8px; font-size: 15px; }
+  .input button { padding: 0 20px; background: #00427a; color: #fff; border: none;
+                  border-radius: 8px; font-size: 15px; cursor: pointer; }
+  .input button:disabled { opacity: .5; cursor: default; }
+  footer { text-align: center; font-size: 12px; color: #888; margin: 20px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CNU 학사 도우미</h1>
+  <p>학사 공지·장학금·졸업 요건 문서를 근거로 답변하는 RAG 챗봇</p>
+</header>
+
+<div class="wrap">
+  <div class="tabs" role="tablist">
+    <button class="tab active" data-cat="">전체</button>
+    <button class="tab" data-cat="학사">학사</button>
+    <button class="tab" data-cat="장학">장학</button>
+    <button class="tab" data-cat="졸업">졸업</button>
+  </div>
+
+  <div class="chat" id="chat" aria-live="polite">
+    <div class="msg bot">안녕하세요! 충남대학교 학사·장학·졸업 관련 궁금한 점을 질문해 주세요.
+답변에는 근거가 된 문서의 출처가 함께 표시됩니다.<div class="suggest">
+        <button>졸업하려면 몇 학점이 필요해?</button>
+        <button>교내 장학금 신청 기간은?</button>
+        <button>휴학 신청은 어떻게 해?</button>
+      </div></div>
+  </div>
+
+  <form class="input" id="form">
+    <input id="q" placeholder="질문을 입력하세요" maxlength="1000" aria-label="질문" autocomplete="off">
+    <button id="send">전송</button>
+  </form>
+</div>
+
+<footer>클라우드 아키텍처 실습 · 9645120265 김종훈 · 공개 문서와 가상 자료 기반, 개인정보는 수집하지 않습니다</footer>
+
+<script>
+  const chat = document.getElementById('chat');
+  const input = document.getElementById('q');
+  const send = document.getElementById('send');
+  let category = '';
+
+  // 학번 대신 브라우저별 익명 ID
+  let userId;
+  try { userId = localStorage.getItem('uid') || crypto.randomUUID(); localStorage.setItem('uid', userId); }
+  catch { userId = crypto.randomUUID(); }
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function post(path, body) {
+    return fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(async r => { const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.error || r.status); return d; });
+  }
+
+  function sourceCard(s) {
+    const d = el('details', 'source');
+    d.append(el('summary', null, `[${s.n}] ${s.title}${s.posted_date ? ' · ' + s.posted_date : ''}`));
+    const where = [s.department, s.article, s.page ? `${s.page}쪽` : ''].filter(Boolean).join(' · ');
+    if (where) d.append(el('div', null, where));
+    d.append(el('blockquote', null, s.excerpt));
+    if (/^https?:\/\//.test(s.url)) {
+      const a = el('a', null, '원문 보기 ↗');
+      a.href = s.url; a.target = '_blank'; a.rel = 'noopener';
+      d.append(a);
+    }
+    return d;
+  }
+
+  function feedbackBox(id) {
+    const box = el('div', 'feedback');
+    const note = el('input'); note.placeholder = '의견(선택)'; note.maxLength = 500; note.setAttribute('aria-label', '의견');
+    const vote = helpful => post('/feedback', { id, helpful, comment: note.value })
+      .then(() => box.replaceChildren(el('span', 'done', '피드백이 저장되었습니다. 감사합니다!')))
+      .catch(() => box.append(el('span', null, '저장 실패, 다시 시도해 주세요')));
+    const up = el('button', null, '👍 도움됨'), down = el('button', null, '👎 도움 안 됨');
+    up.type = down.type = 'button';
+    up.onclick = () => vote(true); down.onclick = () => vote(false);
+    box.append(note, up, down);
+    return box;
+  }
+
+  async function ask(text) {
+    const q = (text || input.value).trim();
+    if (!q || send.disabled) return;
+    input.value = '';
+    const u = el('div', 'msg user'); u.append(el('span', null, q)); chat.append(u);
+    const bot = el('div', 'msg bot loading', '답변 생성 중…'); chat.append(bot);
+    chat.scrollTop = chat.scrollHeight;
+    send.disabled = true;
+    try {
+      const r = await post('/chat', { question: q, category, user_id: userId });
+      bot.classList.remove('loading');
+      bot.textContent = r.answer;
+      r.sources.forEach(s => bot.append(sourceCard(s)));
+      if (r.id) bot.append(feedbackBox(r.id));
+    } catch (e) {
+      bot.classList.remove('loading');
+      bot.textContent = `답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요. (${e.message})`;
+    } finally {
+      send.disabled = false;
+      chat.scrollTop = chat.scrollHeight;
+      input.focus();
+    }
+  }
+
+  document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    category = t.dataset.cat;
+  });
+  document.querySelectorAll('.suggest button').forEach(b => b.onclick = () => ask(b.textContent));
+  document.getElementById('form').onsubmit = e => { e.preventDefault(); ask(); };
+</script>
+</body>
+</html>

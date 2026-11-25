@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: CNU 학사 도우미 - RAG 챗봇 (CloudFront + S3, API Gateway HTTP API + Lambda, Bedrock KB, DynamoDB)
+
+Parameters:
+  KnowledgeBaseId:
+    Type: String
+    Default: ""
+    Description: Bedrock Knowledge Base ID (1차 배포 후 콘솔에서 KB 생성, 2차 배포 때 입력)
+  DataSourceId:
+    Type: String
+    Default: ""
+    Description: KB 데이터 소스 ID (DocsBucket을 가리키는 것)
+  ModelId:
+    Type: String
+    Default: global.anthropic.claude-haiku-5-5
+    Description: 답변 생성 모델 (Bedrock 추론 프로파일 ID)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+    Architectures: [arm64]
+
+Resources:
+  # ---------- 문서 저장소 (KB 데이터 원본) ----------
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # 문서 업로드/삭제 시 KB 재색인
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/sync/
+      Handler: app.handler
+      Environment:
+        Variables:
+          KB_ID: !Ref KnowledgeBaseId
+          DS_ID: !Ref DataSourceId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:StartIngestionJob
+              Resource: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}
+      Events:
+        Created:
+          Type: S3
+          Properties: { Bucket: !Ref DocsBucket, Events: "s3:ObjectCreated:*" }
+        Removed:
+          Type: S3
+          Properties: { Bucket: !Ref DocsBucket, Events: "s3:ObjectRemoved:*" }
+
+  # ---------- 대화·피드백 로그 ----------
+  ChatLogTable:
+    Type: AWS::Serverless::SimpleTable # PK: id (String), 온디맨드
+    Properties:
+      SSESpecification: { SSEEnabled: true }
+
+  # ---------- 백엔드 API ----------
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","route":"$context.routeKey","status":"$context.status","latency":"$context.responseLatency","error":"$context.integrationErrorMessage"}'
+
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { RetentionInDays: 30 }
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/health/
+      Handler: app.handler
+      Events:
+        Get:
+          Type: HttpApi
+          Properties: { ApiId: !Ref Api, Path: /health, Method: GET }
+
+  ChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/chat/
+      Handler: app.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          KB_ID: !Ref KnowledgeBaseId
+          MODEL_ID: !Ref ModelId
+          TABLE: !Ref ChatLogTable
+      Policies:
+        - DynamoDBWritePolicy: { TableName: !Ref ChatLogTable }
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:Retrieve
+              Resource: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${ModelId}
+                - arn:aws:bedrock:*::foundation-model/*
+      Events:
+        Post:
+          Type: HttpApi
+          Properties: { ApiId: !Ref Api, Path: /chat, Method: POST }
+
+  FeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/chat/
+      Handler: app.feedback_handler
+      Environment:
+        Variables:
+          TABLE: !Ref ChatLogTable
+      Policies:
+        - DynamoDBWritePolicy: { TableName: !Ref ChatLogTable }
+      Events:
+        Post:
+          Type: HttpApi
+          Properties: { ApiId: !Ref Api, Path: /feedback, Method: POST }
+
+  # ---------- 웹 프론트엔드 (S3 + CloudFront OAC) ----------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+  # 화면과 API를 같은 도메인으로 제공 → CORS 불필요
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOAC.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !Sub ${Api}.execute-api.${AWS::Region}.amazonaws.com
+            CustomOriginConfig: { OriginProtocolPolicy: https-only }
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+        CacheBehaviors:
+          # CachingDisabled / AllViewerExceptHostHeader 관리형 정책
+          - PathPattern: /chat
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /feedback
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /health
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+Outputs:
+  SiteUrl:
+    Description: 챗봇 웹 주소
+    Value: !Sub https://${Distribution.DomainName}
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  DocsBucketName:
+    Description: KB 데이터 원본 버킷 (학사/ 장학/ 졸업/ 폴더로 업로드)
+    Value: !Ref DocsBucket
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
